@@ -1056,6 +1056,222 @@ func TestUnrealiableReset(t *testing.T) {
 	}, stats)
 }
 
+func TestReset(t *testing.T) {
+	for _, ca := range []string{
+		"reliable",
+		"unrealiable",
+	} {
+		t.Run(ca, func(t *testing.T) {
+			rr := &rtpreceiver.Receiver{
+				ClockRate:            90000,
+				LocalSSRC:            0x65f83afb,
+				UnrealiableTransport: ca == "unrealiable",
+				Period:               500 * time.Millisecond,
+			}
+			err := rr.Initialize()
+			require.NoError(t, err)
+			defer rr.Close()
+
+			ts := time.Date(2008, 5, 20, 22, 15, 20, 0, time.UTC)
+
+			// first position: two consecutive packets
+			pkts, lost := rr.ProcessPacket2(&rtp.Packet{
+				Header: rtp.Header{
+					SequenceNumber: 100,
+					Timestamp:      1000,
+					SSRC:           0xba9da416,
+				},
+			}, ts, true)
+			require.Len(t, pkts, 1)
+			require.Equal(t, uint64(0), lost)
+
+			pkts, lost = rr.ProcessPacket2(&rtp.Packet{
+				Header: rtp.Header{
+					SequenceNumber: 101,
+					Timestamp:      91000,
+					SSRC:           0xba9da416,
+				},
+			}, ts, true)
+			require.Len(t, pkts, 1)
+			require.Equal(t, uint64(0), lost)
+
+			// the source seeks to a new, non-contiguous position
+			rr.Reset()
+
+			// the first packet of the new position is delivered and the
+			// sequence discontinuity is not counted as lost packets
+			pkts, lost = rr.ProcessPacket2(&rtp.Packet{
+				Header: rtp.Header{
+					SequenceNumber: 500,
+					Timestamp:      5000,
+					SSRC:           0xba9da416,
+				},
+			}, ts, true)
+			require.Equal(t, []*rtp.Packet{{
+				Header: rtp.Header{
+					SequenceNumber: 500,
+					Timestamp:      5000,
+					SSRC:           0xba9da416,
+				},
+			}}, pkts)
+			require.Equal(t, uint64(0), lost)
+
+			// normal reception resumes from the new position
+			pkts, lost = rr.ProcessPacket2(&rtp.Packet{
+				Header: rtp.Header{
+					SequenceNumber: 501,
+					Timestamp:      95000,
+					SSRC:           0xba9da416,
+				},
+			}, ts, true)
+			require.Len(t, pkts, 1)
+			require.Equal(t, uint16(501), pkts[0].SequenceNumber)
+			require.Equal(t, uint64(0), lost)
+
+			// cumulative statistics are preserved
+			stats := rr.Stats()
+			require.Equal(t, uint64(4), stats.Received)
+			require.Equal(t, uint64(0), stats.Lost)
+		})
+	}
+}
+
+func TestResetWithSequenceNumber(t *testing.T) {
+	for _, ca := range []string{
+		"reliable",
+		"unrealiable",
+	} {
+		t.Run(ca, func(t *testing.T) {
+			rr := &rtpreceiver.Receiver{
+				ClockRate:            90000,
+				LocalSSRC:            0x65f83afb,
+				UnrealiableTransport: ca == "unrealiable",
+				Period:               500 * time.Millisecond,
+			}
+			err := rr.Initialize()
+			require.NoError(t, err)
+			defer rr.Close()
+
+			ts := time.Date(2008, 5, 20, 22, 15, 20, 0, time.UTC)
+
+			// first position
+			_, lost := rr.ProcessPacket2(&rtp.Packet{
+				Header: rtp.Header{SequenceNumber: 100, SSRC: 0xba9da416},
+			}, ts, true)
+			require.Equal(t, uint64(0), lost)
+
+			// seek: the server declares that the new position starts at seq 500
+			rr.ResetWithSequenceNumber(500)
+
+			// a late packet of the previous position arrives BEFORE the new
+			// position starts: it is discarded without fake loss
+			pkts, lost := rr.ProcessPacket2(&rtp.Packet{
+				Header: rtp.Header{SequenceNumber: 101, SSRC: 0xba9da416},
+			}, ts, true)
+			require.Equal(t, []*rtp.Packet(nil), pkts)
+			require.Equal(t, uint64(0), lost)
+
+			// another late packet, still discarded
+			pkts, lost = rr.ProcessPacket2(&rtp.Packet{
+				Header: rtp.Header{SequenceNumber: 499, SSRC: 0xba9da416},
+			}, ts, true)
+			require.Equal(t, []*rtp.Packet(nil), pkts)
+			require.Equal(t, uint64(0), lost)
+
+			// the declared first packet restarts reception and is delivered
+			pkts, lost = rr.ProcessPacket2(&rtp.Packet{
+				Header: rtp.Header{SequenceNumber: 500, SSRC: 0xba9da416},
+			}, ts, true)
+			require.Len(t, pkts, 1)
+			require.Equal(t, uint16(500), pkts[0].SequenceNumber)
+			require.Equal(t, uint64(0), lost)
+
+			// normal reception resumes
+			pkts, lost = rr.ProcessPacket2(&rtp.Packet{
+				Header: rtp.Header{SequenceNumber: 501, SSRC: 0xba9da416},
+			}, ts, true)
+			require.Len(t, pkts, 1)
+			require.Equal(t, uint16(501), pkts[0].SequenceNumber)
+			require.Equal(t, uint64(0), lost)
+
+			// the late packets that arrived before the new position were not
+			// counted as received or lost
+			stats := rr.Stats()
+			require.Equal(t, uint64(3), stats.Received)
+			require.Equal(t, uint64(0), stats.Lost)
+		})
+	}
+}
+
+func TestResetWithSequenceNumberLatePacketAfterStart(t *testing.T) {
+	// once the new position has started, a late packet of the previous one is
+	// isolated without triggering a discontinuity on an unreliable transport
+	rr := &rtpreceiver.Receiver{
+		ClockRate:            90000,
+		LocalSSRC:            0x65f83afb,
+		UnrealiableTransport: true,
+		Period:               500 * time.Millisecond,
+	}
+	err := rr.Initialize()
+	require.NoError(t, err)
+	defer rr.Close()
+
+	ts := time.Date(2008, 5, 20, 22, 15, 20, 0, time.UTC)
+
+	_, lost := rr.ProcessPacket2(&rtp.Packet{
+		Header: rtp.Header{SequenceNumber: 100, SSRC: 0xba9da416},
+	}, ts, true)
+	require.Equal(t, uint64(0), lost)
+
+	rr.ResetWithSequenceNumber(500)
+
+	// the new position starts
+	pkts, lost := rr.ProcessPacket2(&rtp.Packet{
+		Header: rtp.Header{SequenceNumber: 500, SSRC: 0xba9da416},
+	}, ts, true)
+	require.Len(t, pkts, 1)
+	require.Equal(t, uint64(0), lost)
+
+	// a late packet of the previous position is discarded, not counted as lost
+	pkts, lost = rr.ProcessPacket2(&rtp.Packet{
+		Header: rtp.Header{SequenceNumber: 101, SSRC: 0xba9da416},
+	}, ts, true)
+	require.Equal(t, []*rtp.Packet(nil), pkts)
+	require.Equal(t, uint64(0), lost)
+
+	// reception of the new position continues normally
+	pkts, lost = rr.ProcessPacket2(&rtp.Packet{
+		Header: rtp.Header{SequenceNumber: 501, SSRC: 0xba9da416},
+	}, ts, true)
+	require.Len(t, pkts, 1)
+	require.Equal(t, uint16(501), pkts[0].SequenceNumber)
+	require.Equal(t, uint64(0), lost)
+}
+
+func TestResetWithSequenceNumberFirstPacketsSkipped(t *testing.T) {
+	// if the very first packets of the new position are lost, a later packet
+	// still restarts reception (the armed filter only rejects older packets)
+	rr := &rtpreceiver.Receiver{
+		ClockRate: 90000,
+		LocalSSRC: 0x65f83afb,
+		Period:    500 * time.Millisecond,
+	}
+	err := rr.Initialize()
+	require.NoError(t, err)
+	defer rr.Close()
+
+	ts := time.Date(2008, 5, 20, 22, 15, 20, 0, time.UTC)
+
+	rr.ResetWithSequenceNumber(500)
+
+	pkts, lost := rr.ProcessPacket2(&rtp.Packet{
+		Header: rtp.Header{SequenceNumber: 502, SSRC: 0xba9da416},
+	}, ts, true)
+	require.Len(t, pkts, 1)
+	require.Equal(t, uint16(502), pkts[0].SequenceNumber)
+	require.Equal(t, uint64(0), lost)
+}
+
 func TestUnrealiableCustomBufferSize(t *testing.T) {
 	customSize := 128
 

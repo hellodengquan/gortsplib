@@ -21,12 +21,23 @@ func multiplyAndDivide(v, m, d int64) int64 {
 type globalDecoderTrackData struct {
 	overall int64
 	prev    uint32
+
+	// program timeline anchor (all values are in track clock units)
+	anchorSet      bool
+	anchorRTPTime  uint32 // RTP timestamp corresponding to anchorTimeline
+	anchorTimeline int64  // PTS on the program timeline
 }
 
 func (d *globalDecoderTrackData) decode(ts uint32) int64 {
 	d.overall += int64(int32(ts - d.prev))
 	d.prev = ts
 	return d.overall
+}
+
+// decodeTimeline decodes a timestamp into a PTS on the program timeline.
+// All values are in the track clock units.
+func (d *globalDecoderTrackData) decodeTimeline(ts uint32) int64 {
+	return d.anchorTimeline + int64(int32(ts-d.anchorRTPTime))
 }
 
 // GlobalDecoderTrack is a track (RTSP format or WebRTC track) of GlobalDecoder.
@@ -101,4 +112,56 @@ func (d *GlobalDecoder) Decode(
 	}
 
 	return pts, true
+}
+
+// SetTimelineAnchor maps an RTP timestamp to a position on the program timeline.
+// The anchor is expressed in the clock units of the given track: rtpTime is the
+// RTP timestamp (for instance from the "rtptime" parameter of a RTP-Info header)
+// corresponding to timelinePTS, the position on the program timeline (for
+// instance the start of a Range header converted into track clock units).
+//
+// Anchors set on different tracks all refer to the same program origin, so the
+// PTS values returned by DecodeTimeline can be compared directly between
+// tracks (e.g. audio and video of the same playback).
+func (d *GlobalDecoder) SetTimelineAnchor(
+	track GlobalDecoderTrack,
+	rtpTime uint32,
+	timelinePTS int64,
+) {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
+	df, ok := d.tracks[track]
+	if !ok {
+		df = &globalDecoderTrackData{
+			prev: rtpTime,
+		}
+		d.tracks[track] = df
+	}
+
+	df.anchorSet = true
+	df.anchorRTPTime = rtpTime
+	df.anchorTimeline = timelinePTS
+}
+
+// DecodeTimeline decodes a timestamp into a PTS on the program timeline.
+// The returned value is in the clock units of the track. It is available only
+// if a timeline anchor has been set for the track with SetTimelineAnchor.
+func (d *GlobalDecoder) DecodeTimeline(
+	track GlobalDecoderTrack,
+	pkt *rtp.Packet,
+) (int64, bool) {
+	if track.ClockRate() == 0 {
+		return 0, false
+	}
+
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
+	df, ok := d.tracks[track]
+	if !ok || !df.anchorSet {
+		return 0, false
+	}
+
+	return df.decodeTimeline(pkt.Timestamp), true
 }

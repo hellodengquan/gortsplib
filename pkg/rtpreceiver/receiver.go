@@ -60,6 +60,10 @@ type Receiver struct {
 	received                   uint64
 	receivedAndLostSinceReport uint64
 	jitter                     float64
+	// when set, packets with a sequence number older than this one are
+	// discarded as late packets of a previous position, until the expected
+	// packet (or a later one) restarts the reception.
+	expectedFirstSequenceNumber *uint16
 
 	// data from RTCP sender reports
 	firstSenderReportReceived  bool
@@ -101,6 +105,52 @@ func (rr *Receiver) Initialize() error {
 func (rr *Receiver) Close() {
 	close(rr.terminate)
 	<-rr.done
+}
+
+// Reset resets the stream position of the Receiver.
+// It must be called when the source of the RTP packets changes, for instance
+// after a new PLAY request that seeks to another position.
+// Sequence-number and timestamp tracking are restarted from scratch, so that
+// the discontinuity between the old and the new position is not counted as
+// lost packets and the first packet of the new position is delivered normally.
+// Cumulative statistics (received and lost packet counts, jitter) and data
+// from RTCP sender reports are preserved.
+func (rr *Receiver) Reset() {
+	rr.mutex.Lock()
+	defer rr.mutex.Unlock()
+
+	rr.resetState()
+	rr.expectedFirstSequenceNumber = nil
+}
+
+// ResetWithSequenceNumber resets the stream position like Reset, and also arms
+// the sequence number of the first packet of the new position (typically the
+// "seq" parameter of a RTP-Info header). Packets whose sequence number is older
+// than this one are considered late packets of the previous position and are
+// discarded without affecting delivery or loss statistics, until the expected
+// packet (or a packet newer than it) restarts the reception.
+func (rr *Receiver) ResetWithSequenceNumber(sequenceNumber uint16) {
+	rr.mutex.Lock()
+	defer rr.mutex.Unlock()
+
+	rr.resetState()
+	rr.expectedFirstSequenceNumber = &sequenceNumber
+}
+
+func (rr *Receiver) resetState() {
+	rr.firstRTPPacketReceived = false
+	rr.timeInitialized = false
+	rr.absPos = 0
+	rr.negativeCount = 0
+	rr.sequenceNumberCycles = 0
+	rr.lastSequenceNumber = 0
+	rr.remoteSSRC = 0
+	rr.lastRTP = 0
+	rr.lastSystem = time.Time{}
+
+	if rr.buffer != nil {
+		clear(rr.buffer)
+	}
 }
 
 func (rr *Receiver) run() {
@@ -192,11 +242,25 @@ func (rr *Receiver) ProcessPacket2(
 	rr.mutex.Lock()
 	defer rr.mutex.Unlock()
 
+	// while waiting for the first packet of a new position, discard packets
+	// of the previous position that arrive late.
+	if rr.expectedFirstSequenceNumber != nil {
+		diff := int16(pkt.SequenceNumber - *rr.expectedFirstSequenceNumber)
+		if diff < 0 {
+			return nil, 0
+		}
+
+		// reception of the new position starts
+		rr.expectedFirstSequenceNumber = nil
+	}
+
 	// first packet
 	if !rr.firstRTPPacketReceived {
 		rr.firstRTPPacketReceived = true
-		rr.received = 1
-		rr.receivedAndLostSinceReport = 1
+		// increment instead of assigning so that cumulative statistics survive
+		// a stream-position reset
+		rr.received++
+		rr.receivedAndLostSinceReport++
 		rr.lastSequenceNumber = pkt.SequenceNumber
 		rr.remoteSSRC = pkt.SSRC
 

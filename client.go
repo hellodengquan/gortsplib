@@ -2318,6 +2318,15 @@ func (c *Client) doPlay(ra *headers.Range) (*base.Response, error) {
 	c.startTransportRoutines()
 	c.createWriter()
 
+	// Hold inbound RTP packets until the PLAY response has been processed:
+	// the response can declare a new starting point (Range / RTP-Info), and the
+	// reception must be armed before the packets of the new position are
+	// delivered, otherwise late packets of the previous position or the
+	// sequence discontinuity would be handled with the old state.
+	for _, cm := range c.setuppedMedias {
+		cm.pauseReception()
+	}
+
 	// Range is mandatory in Parrot Streaming Server
 	if ra == nil {
 		ra = &headers.Range{
@@ -2378,6 +2387,7 @@ func (c *Client) doPlay(ra *headers.Range) (*base.Response, error) {
 		Header: header,
 	}, false)
 	if err != nil {
+		c.resumeReception()
 		c.destroyWriter()
 		c.stopTransportRoutines()
 		c.state = clientStatePrePlay
@@ -2385,6 +2395,7 @@ func (c *Client) doPlay(ra *headers.Range) (*base.Response, error) {
 	}
 
 	if res.StatusCode != base.StatusOK {
+		c.resumeReception()
 		c.destroyWriter()
 		c.stopTransportRoutines()
 		c.state = clientStatePrePlay
@@ -2393,11 +2404,28 @@ func (c *Client) doPlay(ra *headers.Range) (*base.Response, error) {
 		}
 	}
 
+	// restart reception from the starting point declared by the server,
+	// if the response provides Range and/or RTP-Info headers. This runs while
+	// inbound packets are still held, so the arming always precedes the
+	// delivery of the packets of the new position.
+	c.applyPlayResponse(res)
+
+	// starting point is armed: packets can now be delivered
+	c.resumeReception()
+
 	c.startWriter()
 
 	c.lastRange = ra
 
 	return res, nil
+}
+
+// resumeReception re-enables the processing of inbound RTP packets, previously
+// held by doPlay while processing the PLAY response.
+func (c *Client) resumeReception() {
+	for _, cm := range c.setuppedMedias {
+		cm.resumeReception()
+	}
 }
 
 // Play sends a PLAY request.
@@ -2411,6 +2439,104 @@ func (c *Client) Play(ra *headers.Range) (*base.Response, error) {
 
 	case <-c.done:
 		return nil, c.closeError
+	}
+}
+
+// timelineStartFromRange extracts the starting point of the program timeline
+// (in NPT units) from a Range header. It returns false if the range does not
+// use a unit that can be mapped to the program timeline.
+func timelineStartFromRange(ra *headers.Range) (time.Duration, bool) {
+	switch v := ra.Value.(type) {
+	case *headers.RangeNPT:
+		return v.Start, true
+
+	case *headers.RangeSMPTE:
+		return v.Start.Time, true
+
+	default:
+		return 0, false
+	}
+}
+
+// applyPlayResponse restarts reception from the starting point declared by the
+// server in a PLAY response. The Range header declares the new position on the
+// program timeline, while the RTP-Info header declares, for each media, the
+// sequence number and RTP timestamp of the first packet of the new position.
+//
+// Both headers are optional and can provide partial information: every piece
+// of information that is available is applied, while missing information keeps
+// the existing delivery behavior. A malformed RTP-Info header is reported as a
+// non-fatal decode error rather than failing the playback.
+func (c *Client) applyPlayResponse(res *base.Response) {
+	// Range header: new position on the program timeline (optional)
+	var timelineStart time.Duration
+	var timelineStartValid bool
+
+	if v, ok := res.Header["Range"]; ok {
+		var ra headers.Range
+		err := ra.Unmarshal(v)
+		if err == nil {
+			timelineStart, timelineStartValid = timelineStartFromRange(&ra)
+		}
+	}
+
+	// RTP-Info header: per-media sequence number and RTP timestamp (optional)
+	var rtpInfo headers.RTPInfo
+	if v, ok := res.Header["RTP-Info"]; ok {
+		err := rtpInfo.Unmarshal(v)
+		if err != nil {
+			c.OnDecodeError(liberrors.ErrClientRTPInfoInvalid{Err: err})
+			rtpInfo = nil
+		}
+	}
+
+	// index setupped medias by their absolute URL, in order to match RTP-Info entries
+	mediaByURL := make(map[string]*clientMedia, len(c.setuppedMedias))
+	for _, cm := range c.setuppedMedias {
+		mediaURL, err := cm.media.URL(c.baseURL)
+		if err == nil {
+			mediaByURL[mediaURL.String()] = cm
+		}
+	}
+
+	for _, entry := range rtpInfo {
+		cm, ok := mediaByURL[entry.URL]
+		if !ok {
+			continue
+		}
+
+		// a sequence number means the server restarts the stream from a new
+		// position: isolate the new position from the previous one.
+		// RTP-Info carries a single sequence number per media, so the sequence
+		// filter is applied only to medias with a single format.
+		if entry.SequenceNumber != nil {
+			for _, cf := range cm.formats {
+				if len(cm.media.Formats) == 1 {
+					cf.restart(entry.SequenceNumber)
+				} else {
+					cf.restart(nil)
+				}
+			}
+		}
+
+		// an RTP timestamp, together with the Range header, anchors the media
+		// to the program timeline. RTP-Info carries a single timestamp per
+		// media, so it is applied only to medias with a single format.
+		if entry.Timestamp != nil && timelineStartValid && len(cm.media.Formats) == 1 {
+			forma := cm.media.Formats[0]
+			cf := cm.formats[forma.PayloadType()]
+
+			// convert the timeline position (NPT) into the format clock units
+			anchorTimeline := int64(
+				float64(timelineStart) / float64(time.Second) *
+					float64(forma.ClockRate()))
+
+			c.timeDecoder.SetTimelineAnchor(
+				cf.format,
+				*entry.Timestamp,
+				anchorTimeline,
+			)
+		}
 	}
 }
 
@@ -2592,6 +2718,25 @@ func (c *Client) PacketPTS(medi *description.Media, pkt *rtp.Packet) (int64, boo
 	cm := c.setuppedMedias[medi]
 	ct := cm.formats[pkt.PayloadType]
 	return c.timeDecoder.Decode(ct.format, pkt)
+}
+
+// PacketPTS2 returns the PTS (presentation timestamp) of an inbound RTP packet
+// on the program timeline, in the clock units of the packet format.
+//
+// Unlike PacketPTS, whose origin depends on when playback started, PacketPTS2
+// returns a position on the program timeline declared by the server: it is
+// derived from the correspondence between the Range and RTP-Info headers of a
+// PLAY response. As a consequence, values of different tracks of the same
+// playback (for instance audio and video) refer to the same origin and can be
+// compared directly, even after a seek.
+//
+// The second return value is false when the server has not provided enough
+// information (Range and RTP-Info) to locate the packet on the program
+// timeline; in that case PacketPTS can still be used.
+func (c *Client) PacketPTS2(medi *description.Media, pkt *rtp.Packet) (int64, bool) {
+	cm := c.setuppedMedias[medi]
+	ct := cm.formats[pkt.PayloadType]
+	return c.timeDecoder.DecodeTimeline(ct.format, pkt)
 }
 
 // PacketNTP returns the NTP (absolute timestamp) of an inbound RTP packet.

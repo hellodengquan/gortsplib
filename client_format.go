@@ -78,6 +78,29 @@ func (cf *clientFormat) close() {
 	}
 }
 
+// restart is called when the source of the stream changes, i.e. after a PLAY
+// request whose response declares a new starting point for this format.
+// It isolates the packets of the new position from the previous ones, so that
+// the discontinuity declared by the server neither produces fake lost packets
+// nor prevents the first packet of the new position from being delivered.
+// When sequenceNumber is not nil, late packets of the previous position whose
+// sequence number is older than it are discarded until the new position starts.
+func (cf *clientFormat) restart(sequenceNumber *uint16) {
+	if cf.rtpReceiver != nil {
+		if sequenceNumber != nil {
+			cf.rtpReceiver.ResetWithSequenceNumber(*sequenceNumber)
+		} else {
+			cf.rtpReceiver.Reset()
+		}
+	}
+
+	// the remote SSRC may change with the new position
+	cf.remoteSSRCMutex.Lock()
+	cf.remoteSSRCFilled = false
+	cf.remoteSSRCValue = 0
+	cf.remoteSSRCMutex.Unlock()
+}
+
 func (cf *clientFormat) stats() SessionStatsFormat { //nolint:dupl
 	var recvStats *rtpreceiver.Stats
 	if cf.rtpReceiver != nil {

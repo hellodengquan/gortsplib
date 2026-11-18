@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -154,10 +155,46 @@ type clientMedia struct {
 	rtcpPacketsReceived    atomic.Uint64
 	rtcpPacketsSent        atomic.Uint64
 	rtcpPacketsInError     atomic.Uint64
+
+	// when paused, inbound RTP packets are held until reception is resumed.
+	// This is used to arm the new starting point of a PLAY response before the
+	// packets of the new position are processed.
+	receivePaused bool
+	receiveCond   *sync.Cond
+	receiveMutex  sync.Mutex
+}
+
+// pauseReception holds the processing of inbound RTP packets until
+// resumeReception is called.
+func (cm *clientMedia) pauseReception() {
+	cm.receiveMutex.Lock()
+	defer cm.receiveMutex.Unlock()
+	cm.receivePaused = true
+}
+
+// resumeReception re-enables the processing of inbound RTP packets and
+// delivers the packets that were held while reception was paused.
+func (cm *clientMedia) resumeReception() {
+	cm.receiveMutex.Lock()
+	cm.receivePaused = false
+	cm.receiveCond.Broadcast()
+	cm.receiveMutex.Unlock()
+}
+
+// waitUntilReceptionResumed blocks while reception is paused.
+func (cm *clientMedia) waitUntilReceptionResumed() {
+	cm.receiveMutex.Lock()
+	defer cm.receiveMutex.Unlock()
+
+	for cm.receivePaused {
+		cm.receiveCond.Wait()
+	}
 }
 
 func (cm *clientMedia) initialize() {
 	cm.onPacketRTCP = func(rtcp.Packet) {}
+
+	cm.receiveCond = sync.NewCond(&cm.receiveMutex)
 
 	cm.formats = make(map[uint8]*clientFormat)
 
@@ -200,6 +237,9 @@ func (cm *clientMedia) initialize() {
 }
 
 func (cm *clientMedia) close() {
+	// unblock any goroutine waiting on the reception gate
+	cm.resumeReception()
+
 	cm.stop()
 
 	for _, ct := range cm.formats {
@@ -299,6 +339,10 @@ func (cm *clientMedia) decodeRTCP(payload []byte) ([]rtcp.Packet, error) {
 }
 
 func (cm *clientMedia) readPacketRTP(payload []byte, now time.Time) bool {
+	// block while a PLAY response is being processed, so that the new starting
+	// point is armed before any packet of the new position is handled
+	cm.waitUntilReceptionResumed()
+
 	var header rtp.Header
 	headerSize, err := header.Unmarshal(payload)
 	if err != nil {
