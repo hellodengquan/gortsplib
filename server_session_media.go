@@ -421,50 +421,42 @@ func (ssm *serverSessionMedia) writePacketRTCP(pkt rtcp.Packet) error {
 	}
 
 	if ssm.srtpOutCtx != nil {
-		return ssm.writePacketRTCPEncoded(encr)
+		_, err = ssm.writePacketRTCPEncoded(encr)
+	} else {
+		_, err = ssm.writePacketRTCPEncoded(plain)
 	}
-	return ssm.writePacketRTCPEncoded(plain)
+	return err
 }
 
-func (ssm *serverSessionMedia) writePacketRTCPEncoded(payload []byte) error {
+func (ssm *serverSessionMedia) writePacketRTCPEncoded(payload []byte) (bool, error) {
 	ssm.ss.writerMutex.RLock()
 	defer ssm.ss.writerMutex.RUnlock()
 
 	if ssm.ss.writer == nil {
-		return nil
+		return false, nil
 	}
 
 	ok := ssm.ss.writer.Push(func() error {
 		return ssm.writePacketRTCPInQueue(payload)
 	})
 	if !ok {
-		return liberrors.ErrServerWriteQueueFull{}
+		return false, liberrors.ErrServerWriteQueueFull{}
 	}
 
-	return nil
+	// statistics must only account for packets that entered the send queue.
+	ssm.bytesSent.Add(uint64(len(payload)))
+	ssm.rtcpPacketsSent.Add(1)
+
+	return true, nil
 }
 
 func (ssm *serverSessionMedia) writePacketRTCPInQueueUDP(payload []byte) error {
-	err := ssm.ss.s.udpRTCPListener.write(payload, ssm.udpRTCPWriteAddr)
-	if err != nil {
-		return err
-	}
-
-	ssm.bytesSent.Add(uint64(len(payload)))
-	ssm.rtcpPacketsSent.Add(1)
-	return nil
+	return ssm.ss.s.udpRTCPListener.write(payload, ssm.udpRTCPWriteAddr)
 }
 
 func (ssm *serverSessionMedia) writePacketRTCPInQueueTCP(payload []byte) error {
 	ssm.ss.tcpFrame.Channel = ssm.tcpChannel + 1
 	ssm.ss.tcpFrame.Payload = payload
 	ssm.ss.tcpConn.nconn.SetWriteDeadline(time.Now().Add(ssm.ss.s.WriteTimeout))
-	err := ssm.ss.tcpConn.conn.WriteInterleavedFrame(ssm.ss.tcpFrame, ssm.ss.tcpBuffer)
-	if err != nil {
-		return err
-	}
-
-	ssm.bytesSent.Add(uint64(len(payload)))
-	ssm.rtcpPacketsSent.Add(1)
-	return nil
+	return ssm.ss.tcpConn.conn.WriteInterleavedFrame(ssm.ss.tcpFrame, ssm.ss.tcpBuffer)
 }

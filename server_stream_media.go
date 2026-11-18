@@ -126,47 +126,61 @@ func (ssm *serverStreamMedia) writePacketRTCP(pkt rtcp.Packet) error {
 	// send unicast
 	for r := range ssm.st.activeUnicastReaders {
 		if sm, ok := r.setuppedMedias[ssm.media]; ok {
+			var sent bool
 			if sm.srtpOutCtx != nil {
-				err = sm.writePacketRTCPEncoded(encr)
+				sent, err = sm.writePacketRTCPEncoded(encr)
 				if err != nil {
 					r.onStreamWriteError(err)
 					continue
 				}
 
-				ssm.bytesSent.Add(encrLen)
+				if sent {
+					ssm.bytesSent.Add(encrLen)
+				}
 			} else {
-				err = sm.writePacketRTCPEncoded(plain)
+				sent, err = sm.writePacketRTCPEncoded(plain)
 				if err != nil {
 					r.onStreamWriteError(err)
 					continue
 				}
 
-				ssm.bytesSent.Add(plainLen)
+				if sent {
+					ssm.bytesSent.Add(plainLen)
+				}
 			}
 
-			ssm.rtcpPacketsSent.Add(1)
+			if sent {
+				ssm.rtcpPacketsSent.Add(1)
+			}
 		}
 	}
 
 	// send multicast
 	if ssm.multicastWriter != nil {
+		var sent bool
 		if ssm.srtpOutCtx != nil {
-			err = ssm.multicastWriter.writePacketRTCPEncoded(encr)
+			sent, err = ssm.multicastWriter.writePacketRTCPEncoded(encr)
 			if err != nil {
 				return err
 			}
 
-			ssm.bytesSent.Add(encrLen)
+			if sent {
+				ssm.bytesSent.Add(encrLen)
+			}
 		} else {
-			err = ssm.multicastWriter.writePacketRTCPEncoded(plain)
+			sent, err = ssm.multicastWriter.writePacketRTCPEncoded(plain)
 			if err != nil {
 				return err
 			}
 
-			ssm.bytesSent.Add(plainLen)
+			if sent {
+				ssm.bytesSent.Add(plainLen)
+			}
 		}
 
-		ssm.rtcpPacketsSent.Add(1)
+		if sent {
+			ssm.rtcpPacketsSent.Add(1)
+		}
 	}
 
 	return nil

@@ -135,15 +135,27 @@ func (ssf *serverStreamFormat) writePacketRTP(pkt *rtp.Packet, ntp time.Time) er
 			var buf []byte
 			if rsm.srtpOutCtx != nil {
 				buf = encr
-				encrReaders++
 			} else {
 				buf = plain
-				plainReaders++
 			}
-			err = rsf.writePacketRTPEncoded(pkt, ntp, ptsEqualsDTS, buf)
+
+			var sent bool
+			sent, err = rsf.writePacketRTPEncoded(pkt, ntp, ptsEqualsDTS, buf)
 			if err != nil {
 				r.onStreamWriteError(err)
 				continue
+			}
+
+			// the reader is waiting for a recovery point: skip it,
+			// without affecting the other readers nor the other medias.
+			if !sent {
+				continue
+			}
+
+			if rsm.srtpOutCtx != nil {
+				encrReaders++
+			} else {
+				plainReaders++
 			}
 		}
 	}
@@ -153,21 +165,26 @@ func (ssf *serverStreamFormat) writePacketRTP(pkt *rtp.Packet, ntp time.Time) er
 		var buf []byte
 		if ssf.ssm.srtpOutCtx != nil {
 			buf = encr
-			encrReaders++
 		} else {
 			buf = plain
-			plainReaders++
 		}
 
-		err = ssf.multicastWriter.writePacketRTPEncoded(pkt, ntp, ptsEqualsDTS, buf)
-		if err != nil {
-			return err
+		if ssf.multicastWriter.writePacketRTPEncoded(pkt, ntp, ptsEqualsDTS, buf) {
+			if ssf.ssm.srtpOutCtx != nil {
+				encrReaders++
+			} else {
+				plainReaders++
+			}
 		}
 	}
 
+	// count only packets and bytes that entered a send queue.
 	ssf.ssm.bytesSent.Add(uint64(len(encr))*encrReaders + uint64(len(plain))*plainReaders)
 
 	ssf.mutex.Lock()
+	// the position of the stream is updated even when no receiver is able to
+	// receive the packet: it always describes the next packet that a receiver
+	// joining now is going to receive, that starts without any limitation.
 	ssf.firstSent = true
 	ssf.rtpPacketsSent += encrReaders + plainReaders
 	ssf.lastSequenceNumber = pkt.SequenceNumber

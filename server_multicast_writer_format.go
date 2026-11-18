@@ -7,7 +7,6 @@ import (
 	"github.com/pion/rtp"
 
 	"github.com/bluenviron/gortsplib/v5/pkg/format"
-	"github.com/bluenviron/gortsplib/v5/pkg/liberrors"
 	"github.com/bluenviron/gortsplib/v5/pkg/rtpsender"
 )
 
@@ -19,9 +18,15 @@ type serverMulticastWriterFormat struct {
 	format                   format.Format
 
 	rtpSender *rtpsender.Sender
+
+	// it suspends the delivery of this media to the multicast group when its
+	// write queue overflows.
+	deliveryGate mediaDeliveryGate
 }
 
 func (smf *serverMulticastWriterFormat) initialize() {
+	smf.deliveryGate.initialize(smf.format)
+
 	smf.rtpSender = &rtpsender.Sender{
 		ClockRate: smf.format.ClockRate(),
 		Period:    smf.senderReportPeriod,
@@ -39,13 +44,20 @@ func (smf *serverMulticastWriterFormat) close() {
 	smf.rtpSender.Close()
 }
 
+// writePacketRTPEncoded writes an encoded RTP packet to the multicast group.
+// It reports whether the packet entered the send queue.
+// Queue overflows never interrupt the writing of the stream.
 func (smf *serverMulticastWriterFormat) writePacketRTPEncoded(
 	pkt *rtp.Packet,
 	ntp time.Time,
 	ptsEqualsDTS bool,
 	payload []byte,
-) error {
-	smf.rtpSender.ProcessPacket(pkt, ntp, ptsEqualsDTS)
+) bool {
+	// when the queue overflowed, the media is suspended until an
+	// independently decodable picture is available.
+	if !smf.deliveryGate.isWritable(pkt) {
+		return false
+	}
 
 	ok := smf.smm.writer.Push(func() error {
 		smf.smm.rtpl.write(payload, smf.smm.rtpAddr) //nolint:errcheck
@@ -56,8 +68,13 @@ func (smf *serverMulticastWriterFormat) writePacketRTPEncoded(
 		return nil
 	})
 	if !ok {
-		return liberrors.ErrServerWriteQueueFull{}
+		smf.deliveryGate.onQueueFull()
+		return false
 	}
 
-	return nil
+	// statistics and RTCP sender reports must only account for
+	// packets that entered the send queue.
+	smf.rtpSender.ProcessPacket(pkt, ntp, ptsEqualsDTS)
+
+	return true
 }

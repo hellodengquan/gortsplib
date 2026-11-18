@@ -27,6 +27,11 @@ type serverSessionFormat struct {
 	rtpReceiver           *rtpreceiver.Receiver // record or back channel
 	writePacketRTPInQueue func([]byte) error
 	rtpSender             *rtpsender.Sender // play
+
+	// play only.
+	// it suspends the delivery of this media to this session when its
+	// write queue overflows.
+	deliveryGate mediaDeliveryGate
 }
 
 func (ssf *serverSessionFormat) initialize() {
@@ -38,6 +43,8 @@ func (ssf *serverSessionFormat) initialize() {
 	} else {
 		ssf.writePacketRTPInQueue = ssf.writePacketRTPInQueueTCP
 	}
+
+	ssf.deliveryGate.initialize(ssf.format)
 
 	if ssf.ssm.ss.state == ServerSessionStatePreRecord || ssf.ssm.media.IsBackChannel {
 		ssf.rtpReceiver = &rtpreceiver.Receiver{
@@ -309,36 +316,52 @@ func (ssf *serverSessionFormat) writePacketRTP(pkt *rtp.Packet, ntp time.Time) e
 	ptsEqualsDTS := ssf.format.PTSEqualsDTS(pkt)
 
 	if ssf.ssm.srtpOutCtx != nil {
-		return ssf.writePacketRTPEncoded(pkt, ntp, ptsEqualsDTS, encr)
+		_, err = ssf.writePacketRTPEncoded(pkt, ntp, ptsEqualsDTS, encr)
+	} else {
+		_, err = ssf.writePacketRTPEncoded(pkt, ntp, ptsEqualsDTS, plain)
 	}
-	return ssf.writePacketRTPEncoded(pkt, ntp, ptsEqualsDTS, plain)
+	return err
 }
 
+// writePacketRTPEncoded writes an encoded RTP packet to the session.
+// It reports whether the packet entered the send queue of the session.
 func (ssf *serverSessionFormat) writePacketRTPEncoded(
 	pkt *rtp.Packet,
 	ntp time.Time,
 	ptsEqualsDTS bool,
 	payload []byte,
-) error {
+) (bool, error) {
+	// when the queue of this receiver overflowed, the media is suspended
+	// until an independently decodable picture is available.
+	if !ssf.deliveryGate.isWritable(pkt) {
+		return false, nil
+	}
+
+	ssf.ssm.ss.writerMutex.RLock()
+	writer := ssf.ssm.ss.writer
+	if writer == nil {
+		ssf.ssm.ss.writerMutex.RUnlock()
+		return false, nil
+	}
+
+	ok := writer.Push(func() error {
+		return ssf.writePacketRTPInQueue(payload)
+	})
+
+	ssf.ssm.ss.writerMutex.RUnlock()
+
+	if !ok {
+		ssf.deliveryGate.onQueueFull()
+		return false, liberrors.ErrServerWriteQueueFull{}
+	}
+
+	// statistics and RTCP sender reports must only account for
+	// packets that entered the send queue.
 	ssf.rtpSender.ProcessPacket(pkt, ntp, ptsEqualsDTS)
 
 	ssf.ssm.bytesSent.Add(uint64(len(payload)))
 
-	ssf.ssm.ss.writerMutex.RLock()
-	defer ssf.ssm.ss.writerMutex.RUnlock()
-
-	if ssf.ssm.ss.writer == nil {
-		return nil
-	}
-
-	ok := ssf.ssm.ss.writer.Push(func() error {
-		return ssf.writePacketRTPInQueue(payload)
-	})
-	if !ok {
-		return liberrors.ErrServerWriteQueueFull{}
-	}
-
-	return nil
+	return true, nil
 }
 
 func (ssf *serverSessionFormat) writePacketRTPInQueueUDP(payload []byte) error {

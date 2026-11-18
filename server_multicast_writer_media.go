@@ -113,12 +113,14 @@ func (smm *serverMulticastWriterMedia) writePacketRTCP(pkt rtcp.Packet) error {
 	}
 
 	if smm.srtpOutCtx != nil {
-		return smm.writePacketRTCPEncoded(encr)
+		_, err = smm.writePacketRTCPEncoded(encr)
+	} else {
+		_, err = smm.writePacketRTCPEncoded(plain)
 	}
-	return smm.writePacketRTCPEncoded(plain)
+	return err
 }
 
-func (smm *serverMulticastWriterMedia) writePacketRTCPEncoded(payload []byte) error {
+func (smm *serverMulticastWriterMedia) writePacketRTCPEncoded(payload []byte) (bool, error) {
 	ok := smm.writer.Push(func() error {
 		smm.rtcpl.write(payload, smm.rtcpAddr) //nolint:errcheck
 
@@ -128,8 +130,8 @@ func (smm *serverMulticastWriterMedia) writePacketRTCPEncoded(payload []byte) er
 		return nil
 	})
 	if !ok {
-		return liberrors.ErrServerWriteQueueFull{}
+		return false, liberrors.ErrServerWriteQueueFull{}
 	}
 
-	return nil
+	return true, nil
 }
