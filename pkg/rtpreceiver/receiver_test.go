@@ -8,6 +8,7 @@ import (
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 
+	"github.com/bluenviron/gortsplib/v5/pkg/ntp"
 	"github.com/bluenviron/gortsplib/v5/pkg/rtpreceiver"
 )
 
@@ -1116,4 +1117,254 @@ func TestUnrealiableCustomBufferSize(t *testing.T) {
 		TotalReceived:      12,
 		TotalLost:          130,
 	}, stats)
+}
+
+func TestSourceChange(t *testing.T) {
+	rr := &rtpreceiver.Receiver{
+		ClockRate: 90000,
+		LocalSSRC: 0x65f83afb,
+		Period:    500 * time.Millisecond,
+		TimeNow: func() time.Time {
+			return time.Date(2008, 0o5, 20, 22, 15, 20, 0, time.UTC)
+		},
+	}
+	err := rr.Initialize()
+	require.NoError(t, err)
+	defer rr.Close()
+
+	ts := time.Date(2008, 0o5, 20, 22, 15, 20, 0, time.UTC)
+
+	pkt := &rtp.Packet{Header: rtp.Header{
+		Version:        2,
+		PayloadType:    96,
+		SequenceNumber: 100,
+		Timestamp:      1000,
+		SSRC:           11,
+	}}
+	pkts, lost := rr.ProcessPacket2(pkt, ts, true)
+	require.Equal(t, []*rtp.Packet{pkt}, pkts)
+	require.Equal(t, uint64(0), lost)
+
+	pkt = &rtp.Packet{Header: rtp.Header{
+		Version:        2,
+		PayloadType:    96,
+		SequenceNumber: 101,
+		Timestamp:      4000,
+		SSRC:           11,
+	}}
+	pkts, lost = rr.ProcessPacket2(pkt, ts, true)
+	require.Equal(t, []*rtp.Packet{pkt}, pkts)
+	require.Equal(t, uint64(0), lost)
+
+	// new source: the first packet is delivered, and its sequence number
+	// becomes the new expected one, without any lost packet.
+	pkt = &rtp.Packet{Header: rtp.Header{
+		Version:        2,
+		PayloadType:    96,
+		SequenceNumber: 5000,
+		Timestamp:      700000,
+		SSRC:           22,
+	}}
+	pkts, lost = rr.ProcessPacket2(pkt, ts, true)
+	require.Equal(t, []*rtp.Packet{pkt}, pkts)
+	require.Equal(t, uint64(0), lost)
+
+	// packets of the new source are delivered according to its sequence numbers
+	pkt = &rtp.Packet{Header: rtp.Header{
+		Version:        2,
+		PayloadType:    96,
+		SequenceNumber: 5002,
+		Timestamp:      703000,
+		SSRC:           22,
+	}}
+	pkts, lost = rr.ProcessPacket2(pkt, ts, true)
+	require.Equal(t, []*rtp.Packet{pkt}, pkts)
+	require.Equal(t, uint64(1), lost)
+
+	// late packets of the previous source are discarded and do not make the
+	// receiver switch back.
+	pkt = &rtp.Packet{Header: rtp.Header{
+		Version:        2,
+		PayloadType:    96,
+		SequenceNumber: 102,
+		Timestamp:      7000,
+		SSRC:           11,
+	}}
+	pkts, lost = rr.ProcessPacket2(pkt, ts, true)
+	require.Nil(t, pkts)
+	require.Equal(t, uint64(0), lost)
+
+	// the current source is still the new one
+	pkt = &rtp.Packet{Header: rtp.Header{
+		Version:        2,
+		PayloadType:    96,
+		SequenceNumber: 5003,
+		Timestamp:      706000,
+		SSRC:           22,
+	}}
+	pkts, lost = rr.ProcessPacket2(pkt, ts, true)
+	require.Equal(t, []*rtp.Packet{pkt}, pkts)
+	require.Equal(t, uint64(0), lost)
+
+	ssrc, ok := rr.RemoteSSRC()
+	require.True(t, ok)
+	require.Equal(t, uint32(22), ssrc)
+}
+
+func TestSourceChangeOldSourceRestarts(t *testing.T) {
+	rr := &rtpreceiver.Receiver{
+		ClockRate: 90000,
+		LocalSSRC: 0x65f83afb,
+		Period:    500 * time.Millisecond,
+		TimeNow: func() time.Time {
+			return time.Date(2008, 0o5, 20, 22, 15, 20, 0, time.UTC)
+		},
+	}
+	err := rr.Initialize()
+	require.NoError(t, err)
+	defer rr.Close()
+
+	ts := time.Date(2008, 0o5, 20, 22, 15, 20, 0, time.UTC)
+
+	rr.ProcessPacket2(&rtp.Packet{Header: rtp.Header{
+		SequenceNumber: 100,
+		SSRC:           11,
+	}}, ts, true)
+	rr.ProcessPacket2(&rtp.Packet{Header: rtp.Header{
+		SequenceNumber: 1,
+		SSRC:           22,
+	}}, ts, true)
+
+	// once the current source has been silent for the retired source period,
+	// the previous source is accepted again.
+	later := ts.Add(3 * time.Second)
+
+	pkt := &rtp.Packet{Header: rtp.Header{
+		SequenceNumber: 101,
+		SSRC:           11,
+	}}
+	pkts, lost := rr.ProcessPacket2(pkt, later, true)
+	require.Equal(t, []*rtp.Packet{pkt}, pkts)
+	require.Equal(t, uint64(0), lost)
+
+	ssrc, ok := rr.RemoteSSRC()
+	require.True(t, ok)
+	require.Equal(t, uint32(11), ssrc)
+}
+
+func TestSourceChangeSenderReports(t *testing.T) {
+	rr := &rtpreceiver.Receiver{
+		ClockRate: 90000,
+		LocalSSRC: 0x65f83afb,
+		Period:    5 * time.Second,
+		TimeNow: func() time.Time {
+			return time.Date(2008, 0o5, 20, 22, 15, 20, 0, time.UTC)
+		},
+	}
+	err := rr.Initialize()
+	require.NoError(t, err)
+	defer rr.Close()
+
+	ts := time.Date(2008, 0o5, 20, 22, 15, 20, 0, time.UTC)
+	origin := time.Date(2018, 2, 20, 19, 0, 0, 0, time.UTC)
+
+	// a report received before the first RTP packet retains its source
+	rr.ProcessSenderReport(&rtcp.SenderReport{
+		SSRC:    22,
+		NTPTime: ntp.Encode(origin.Add(time.Hour)),
+		RTPTime: 5000,
+	}, ts)
+
+	rr.ProcessPacket2(&rtp.Packet{Header: rtp.Header{
+		SequenceNumber: 100,
+		Timestamp:      1000,
+		SSRC:           11,
+	}}, ts, true)
+
+	// the absolute time of the first source is not available: the only report
+	// available belongs to another source.
+	_, ok := rr.PacketNTP(1000)
+	require.False(t, ok)
+
+	rr.ProcessSenderReport(&rtcp.SenderReport{
+		SSRC:    11,
+		NTPTime: ntp.Encode(origin),
+		RTPTime: 1000,
+	}, ts)
+
+	// after switching to the new source, its own report (received before its
+	// first packet) provides the absolute time.
+	rr.ProcessPacket2(&rtp.Packet{Header: rtp.Header{
+		SequenceNumber: 1,
+		Timestamp:      5000,
+		SSRC:           22,
+	}}, ts, true)
+
+	v, ok := rr.PacketNTP(5000)
+	require.True(t, ok)
+	require.Equal(t, origin.Add(time.Hour), v.UTC())
+
+	// a report of the previous source cannot override the current absolute time
+	rr.ProcessSenderReport(&rtcp.SenderReport{
+		SSRC:    11,
+		NTPTime: ntp.Encode(origin.Add(48 * time.Hour)),
+		RTPTime: 5000,
+	}, ts)
+
+	v, ok = rr.PacketNTP(5000)
+	require.True(t, ok)
+	require.Equal(t, origin.Add(time.Hour), v.UTC())
+}
+
+func TestSourceChangeReceiverReport(t *testing.T) {
+	pktGenerated := make(chan rtcp.Packet)
+
+	rr := &rtpreceiver.Receiver{
+		ClockRate: 90000,
+		LocalSSRC: 0x65f83afb,
+		Period:    300 * time.Millisecond,
+		TimeNow: func() time.Time {
+			return time.Date(2008, 0o5, 20, 22, 15, 22, 0, time.UTC)
+		},
+		WritePacketRTCP: func(pkt rtcp.Packet) {
+			pktGenerated <- pkt
+		},
+	}
+	err := rr.Initialize()
+	require.NoError(t, err)
+	defer rr.Close()
+
+	ts := time.Date(2008, 0o5, 20, 22, 15, 20, 0, time.UTC)
+
+	rr.ProcessSenderReport(&rtcp.SenderReport{
+		SSRC:    11,
+		NTPTime: ntp.Encode(ts),
+		RTPTime: 1000,
+	}, ts)
+
+	rr.ProcessPacket2(&rtp.Packet{Header: rtp.Header{
+		SequenceNumber: 100,
+		Timestamp:      1000,
+		SSRC:           11,
+	}}, ts, true)
+
+	rr.ProcessPacket2(&rtp.Packet{Header: rtp.Header{
+		SequenceNumber: 1,
+		Timestamp:      5000,
+		SSRC:           22,
+	}}, ts, true)
+
+	pkt := <-pktGenerated
+
+	// the receiver report belongs to the current source, and has no sender
+	// report data, since the new source did not send any report yet.
+	require.Equal(t, &rtcp.ReceiverReport{
+		SSRC: 0x65f83afb,
+		Reports: []rtcp.ReceptionReport{
+			{
+				SSRC:               22,
+				LastSequenceNumber: 1,
+			},
+		},
+	}, pkt)
 }

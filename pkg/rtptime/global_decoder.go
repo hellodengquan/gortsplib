@@ -102,3 +102,49 @@ func (d *GlobalDecoder) Decode(
 
 	return pts, true
 }
+
+// SwitchSource notifies the decoder that the RTP source of a track changed,
+// for instance because the camera has been rebooted and it restarted sending
+// packets with a new SSRC and a new timestamp base.
+//
+// The timeline is kept continuous: packets of the new source are decoded
+// starting from a PTS that follows the timeline of the leading track at the
+// time of the switch, instead of producing a jump caused by the new timestamp
+// base. Other tracks are not affected.
+//
+// pkt is the first packet of the new source.
+func (d *GlobalDecoder) SwitchSource(
+	track GlobalDecoderTrack,
+	pkt *rtp.Packet,
+) {
+	if track.ClockRate() == 0 {
+		return
+	}
+
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
+	now := timeNow()
+
+	if d.leadingTrack == nil {
+		d.leadingTrack = track
+		d.startSystem = now
+		d.startPTS = 0
+		d.startPTSClockRate = int64(track.ClockRate())
+	}
+
+	// continue the timeline from the PTS the leading track has at this
+	// moment, as if the new source started at the switch time.
+	startPTS := multiplyAndDivide(d.startPTS, int64(track.ClockRate()), d.startPTSClockRate)
+	startPTS += multiplyAndDivide(int64(now.Sub(d.startSystem)), int64(track.ClockRate()), int64(time.Second))
+
+	d.tracks[track] = &globalDecoderTrackData{
+		overall: startPTS,
+		prev:    pkt.Timestamp,
+	}
+
+	if d.leadingTrack == track {
+		d.startSystem = now
+		d.startPTS = startPTS
+	}
+}

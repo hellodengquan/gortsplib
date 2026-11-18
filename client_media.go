@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -145,15 +146,17 @@ type clientMedia struct {
 	srtpInCtx       *wrappedSRTPContext
 	srtpOutCtx      *wrappedSRTPContext
 
-	onPacketRTCP           OnPacketRTCPFunc
-	formats                map[uint8]*clientFormat
-	writePacketRTCPInQueue func([]byte) error
-	bytesReceived          atomic.Uint64
-	bytesSent              atomic.Uint64
-	rtpPacketsInError      atomic.Uint64
-	rtcpPacketsReceived    atomic.Uint64
-	rtcpPacketsSent        atomic.Uint64
-	rtcpPacketsInError     atomic.Uint64
+	onPacketRTCP              OnPacketRTCPFunc
+	formats                   map[uint8]*clientFormat
+	pendingSenderReportsMutex sync.Mutex
+	pendingSenderReports      pendingSenderReports
+	writePacketRTCPInQueue    func([]byte) error
+	bytesReceived             atomic.Uint64
+	bytesSent                 atomic.Uint64
+	rtpPacketsInError         atomic.Uint64
+	rtcpPacketsReceived       atomic.Uint64
+	rtcpPacketsSent           atomic.Uint64
+	rtcpPacketsInError        atomic.Uint64
 }
 
 func (cm *clientMedia) initialize() {
@@ -327,12 +330,24 @@ func (cm *clientMedia) readPacketRTCPPlay(payload []byte) bool {
 	cm.rtcpPacketsReceived.Add(uint64(len(packets)))
 
 	for _, pkt := range packets {
-		if sr, ok := pkt.(*rtcp.SenderReport); ok {
-			format := cm.findFormatByRemoteSSRC(sr.SSRC)
+		cm.pendingSenderReportsMutex.Lock()
+		switch pkt := pkt.(type) {
+		case *rtcp.SenderReport:
+			format := cm.findFormatByRemoteSSRC(pkt.SSRC)
 			if format != nil {
-				format.rtpReceiver.ProcessSenderReport(sr, now)
+				format.rtpReceiver.ProcessSenderReport(pkt, now)
+			} else {
+				// the source is not known yet (its first RTP packet has not
+				// been received): keep the report for when it is.
+				cm.pendingSenderReports.add(pkt, now)
+			}
+
+		case *rtcp.Goodbye:
+			for _, source := range pkt.Sources {
+				cm.pendingSenderReports.remove(source)
 			}
 		}
+		cm.pendingSenderReportsMutex.Unlock()
 
 		cm.onPacketRTCP(pkt)
 	}

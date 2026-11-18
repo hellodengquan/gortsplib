@@ -2,7 +2,6 @@ package gortsplib
 
 import (
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/pion/rtcp"
@@ -20,9 +19,6 @@ type clientFormat struct {
 	localSSRC   uint32
 	onPacketRTP OnPacketRTPFunc
 
-	remoteSSRCMutex       sync.RWMutex          // play
-	remoteSSRCFilled      bool                  // play
-	remoteSSRCValue       uint32                // play
 	rtpReceiver           *rtpreceiver.Receiver // play
 	rtpSender             *rtpsender.Sender     // record or back channel
 	writePacketRTPInQueue func([]byte) error
@@ -57,6 +53,17 @@ func (cf *clientFormat) initialize() {
 			WritePacketRTCP: func(pkt rtcp.Packet) {
 				if cf.cm.udpRTPListener != nil && cf.cm.udpRTCPListener.writeAddr != nil {
 					cf.cm.c.WritePacketRTCP(cf.cm.media, pkt) //nolint:errcheck
+				}
+			},
+			OnSourceChange: func(pkt *rtp.Packet) {
+				// a report of the new source might have been received before
+				// its first packet.
+				cf.applyPendingSenderReport(pkt.SSRC)
+
+				// the timeline of the new source must continue the previous
+				// one, instead of jumping back to the new timestamp base.
+				if td := cf.cm.c.timeDecoder.Load(); td != nil {
+					td.SwitchSource(cf.format, pkt)
 				}
 			},
 		}
@@ -225,30 +232,33 @@ func (cf *clientFormat) stats() SessionStatsFormat { //nolint:dupl
 }
 
 func (cf *clientFormat) remoteSSRC() (uint32, bool) {
-	cf.remoteSSRCMutex.RLock()
-	defer cf.remoteSSRCMutex.RUnlock()
-	return cf.remoteSSRCValue, cf.remoteSSRCFilled
+	if cf.rtpReceiver == nil {
+		return 0, false
+	}
+	return cf.rtpReceiver.RemoteSSRC()
 }
 
 func (cf *clientFormat) readPacketRTP(payload []byte, header *rtp.Header, headerSize int, now time.Time) bool {
-	if !cf.remoteSSRCFilled {
-		cf.remoteSSRCMutex.Lock()
-		cf.remoteSSRCFilled = true
-		cf.remoteSSRCValue = header.SSRC
-		cf.remoteSSRCMutex.Unlock()
-
-		// a wrong SSRC is an issue only when encryption is enabled, since it spams srtp.Context.DecryptRTP.
-	} else if cf.cm.srtpInCtx != nil &&
-		header.SSRC != cf.remoteSSRCValue {
-		cf.cm.onPacketRTPDecodeError(fmt.Errorf("received packet with wrong SSRC %d, expected %d",
-			header.SSRC, cf.remoteSSRCValue))
-		return false
+	// with encryption, the SSRC is part of the cryptographic association:
+	// packets with another SSRC cannot be decrypted and must be rejected.
+	if cf.cm.srtpInCtx != nil {
+		if ssrc, ok := cf.rtpReceiver.RemoteSSRC(); ok && header.SSRC != ssrc {
+			cf.cm.onPacketRTPDecodeError(fmt.Errorf("received packet with wrong SSRC %d, expected %d",
+				header.SSRC, ssrc))
+			return false
+		}
 	}
 
 	pkt, err := cf.cm.decodeRTP(payload, header, headerSize)
 	if err != nil {
 		cf.cm.onPacketRTPDecodeError(err)
 		return false
+	}
+
+	if _, ok := cf.rtpReceiver.RemoteSSRC(); !ok {
+		// first packet of the first source: a report may have been received
+		// before it.
+		cf.applyPendingSenderReport(pkt.SSRC)
 	}
 
 	pkts, lost := cf.rtpReceiver.ProcessPacket2(pkt, now, cf.format.PTSEqualsDTS(pkt))
@@ -262,6 +272,18 @@ func (cf *clientFormat) readPacketRTP(payload []byte, header *rtp.Header, header
 	}
 
 	return true
+}
+
+// applyPendingSenderReport feeds the receiver with an RTCP sender report of
+// the given source that was received before the first packet of the source.
+func (cf *clientFormat) applyPendingSenderReport(ssrc uint32) {
+	cf.cm.pendingSenderReportsMutex.Lock()
+	pending, ok := cf.cm.pendingSenderReports.take(ssrc)
+	cf.cm.pendingSenderReportsMutex.Unlock()
+
+	if ok {
+		cf.rtpReceiver.ProcessSenderReport(&pending.report, pending.receivedAt)
+	}
 }
 
 func (cf *clientFormat) writePacketRTP(pkt *rtp.Packet, ntp time.Time) error {

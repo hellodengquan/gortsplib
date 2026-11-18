@@ -367,7 +367,7 @@ type ServerSession struct {
 	udpCheckStreamTimer   *time.Timer
 	writerMutex           sync.RWMutex
 	writer                *asyncprocessor.Processor
-	timeDecoder           *rtptime.GlobalDecoder
+	timeDecoder           atomic.Pointer[rtptime.GlobalDecoder]
 	tcpFrame              *base.InterleavedFrame
 	tcpBuffer             []byte
 
@@ -1291,8 +1291,9 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 
 				ss.udpLastPacketTime.Store(ss.s.timeNow().Unix())
 
-				ss.timeDecoder = &rtptime.GlobalDecoder{}
-				ss.timeDecoder.Initialize()
+				td := &rtptime.GlobalDecoder{}
+				td.Initialize()
+				ss.timeDecoder.Store(td)
 
 				for _, sm := range ss.setuppedMedias {
 					err = sm.start()
@@ -1385,8 +1386,9 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 
 			ss.udpLastPacketTime.Store(ss.s.timeNow().Unix())
 
-			ss.timeDecoder = &rtptime.GlobalDecoder{}
-			ss.timeDecoder.Initialize()
+			td := &rtptime.GlobalDecoder{}
+			td.Initialize()
+			ss.timeDecoder.Store(td)
 
 			for _, sm := range ss.setuppedMedias {
 				err = sm.start()
@@ -1455,7 +1457,7 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 					sm.stop()
 				}
 
-				ss.timeDecoder = nil
+				ss.timeDecoder.Store(nil)
 
 				switch ss.state {
 				case ServerSessionStatePlay:
@@ -1626,7 +1628,13 @@ func (ss *ServerSession) WritePacketRTCP(medi *description.Media, pkt rtcp.Packe
 func (ss *ServerSession) PacketPTS(medi *description.Media, pkt *rtp.Packet) (int64, bool) {
 	sm := ss.setuppedMedias[medi]
 	sf := sm.formats[pkt.PayloadType]
-	return ss.timeDecoder.Decode(sf.format, pkt)
+
+	td := ss.timeDecoder.Load()
+	if td == nil {
+		return 0, false
+	}
+
+	return td.Decode(sf.format, pkt)
 }
 
 // PacketNTP returns the NTP (absolute timestamp) of an inbound RTP packet.

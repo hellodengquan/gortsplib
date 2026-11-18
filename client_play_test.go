@@ -4976,3 +4976,283 @@ func TestClientPlayH264PacketizationMode0SwitchToTCP(t *testing.T) {
 
 	<-packetRecv
 }
+
+func TestClientPlaySourceChange(t *testing.T) {
+	l, err := net.Listen("tcp", "localhost:8554")
+	require.NoError(t, err)
+	defer l.Close()
+
+	serverDone := make(chan struct{})
+	defer func() { <-serverDone }()
+
+	go func() {
+		defer close(serverDone)
+
+		nconn, err2 := l.Accept()
+		require.NoError(t, err2)
+		defer nconn.Close()
+		conn := conn.NewConn(bufio.NewReader(nconn), nconn)
+
+		req, err2 := conn.ReadRequest()
+		require.NoError(t, err2)
+		require.Equal(t, base.Options, req.Method)
+
+		err2 = conn.WriteResponse(&base.Response{
+			StatusCode: base.StatusOK,
+			Header: base.Header{
+				"Public": base.HeaderValue{strings.Join([]string{
+					string(base.Describe),
+					string(base.Setup),
+					string(base.Play),
+				}, ", ")},
+			},
+		})
+		require.NoError(t, err2)
+
+		req, err2 = conn.ReadRequest()
+		require.NoError(t, err2)
+		require.Equal(t, base.Describe, req.Method)
+
+		medias := []*description.Media{testH264Media}
+
+		err2 = conn.WriteResponse(&base.Response{
+			StatusCode: base.StatusOK,
+			Header: base.Header{
+				"Content-Type": base.HeaderValue{"application/sdp"},
+				"Content-Base": base.HeaderValue{"rtsp://localhost:8554/teststream/"},
+			},
+			Body: mediasToSDP(medias),
+		})
+		require.NoError(t, err2)
+
+		req, err2 = conn.ReadRequest()
+		require.NoError(t, err2)
+		require.Equal(t, base.Setup, req.Method)
+
+		var inTH headers.Transport
+		err2 = inTH.Unmarshal(req.Header["Transport"])
+		require.NoError(t, err2)
+
+		l1, err2 := net.ListenPacket("udp", "localhost:27556")
+		require.NoError(t, err2)
+		defer l1.Close()
+
+		l2, err2 := net.ListenPacket("udp", "localhost:27557")
+		require.NoError(t, err2)
+		defer l2.Close()
+
+		err2 = conn.WriteResponse(&base.Response{
+			StatusCode: base.StatusOK,
+			Header: base.Header{
+				"Transport": headers.Transport{
+					Protocol:    headers.TransportProtocolUDP,
+					Delivery:    new(headers.TransportDeliveryUnicast),
+					ServerPorts: &[2]int{27556, 27557},
+					ClientPorts: inTH.ClientPorts,
+				}.Marshal(),
+			},
+		})
+		require.NoError(t, err2)
+
+		req, err2 = conn.ReadRequest()
+		require.NoError(t, err2)
+		require.Equal(t, base.Play, req.Method)
+
+		err2 = conn.WriteResponse(&base.Response{
+			StatusCode: base.StatusOK,
+		})
+		require.NoError(t, err2)
+
+		// skip firewall opening
+		buf := make([]byte, 2048)
+		_, _, err2 = l2.ReadFrom(buf)
+		require.NoError(t, err2)
+
+		writeRTP := func(pkt *rtp.Packet) {
+			_, err3 := l1.WriteTo(mustMarshalPacketRTP(pkt), &net.UDPAddr{
+				IP:   net.ParseIP("127.0.0.1"),
+				Port: inTH.ClientPorts[0],
+			})
+			require.NoError(t, err3)
+		}
+
+		writeSR := func(pkt *rtcp.SenderReport) {
+			_, err3 := l2.WriteTo(mustMarshalPacketRTCP(pkt), &net.UDPAddr{
+				IP:   net.ParseIP("127.0.0.1"),
+				Port: inTH.ClientPorts[1],
+			})
+			require.NoError(t, err3)
+		}
+
+		writeRTP(&rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				Marker:         true,
+				PayloadType:    96,
+				SequenceNumber: 1,
+				Timestamp:      1000,
+				SSRC:           1111,
+			},
+			Payload: []byte{5, 1, 2, 3},
+		})
+
+		writeRTP(&rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				Marker:         true,
+				PayloadType:    96,
+				SequenceNumber: 2,
+				Timestamp:      4000,
+				SSRC:           1111,
+			},
+			Payload: []byte{5, 4, 5, 6},
+		})
+
+		writeSR(&rtcp.SenderReport{
+			SSRC:    2222,
+			NTPTime: ntp.Encode(time.Date(2018, 2, 20, 19, 0, 0, 0, time.UTC)),
+			RTPTime: 100000,
+		})
+
+		time.Sleep(100 * time.Millisecond)
+
+		// the camera is rebooted: the source changes.
+		writeRTP(&rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				Marker:         true,
+				PayloadType:    96,
+				SequenceNumber: 9000,
+				Timestamp:      100000,
+				SSRC:           2222,
+			},
+			Payload: []byte{5, 7, 8, 9},
+		})
+
+		// a late packet of the previous source must not switch back.
+		writeRTP(&rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				Marker:         true,
+				PayloadType:    96,
+				SequenceNumber: 3,
+				Timestamp:      7000,
+				SSRC:           1111,
+			},
+			Payload: []byte{5, 10, 11, 12},
+		})
+
+		writeRTP(&rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				Marker:         true,
+				PayloadType:    96,
+				SequenceNumber: 9001,
+				Timestamp:      103000,
+				SSRC:           2222,
+			},
+			Payload: []byte{5, 13, 14, 15},
+		})
+
+		req, err2 = conn.ReadRequest()
+		require.NoError(t, err2)
+		require.Equal(t, base.Teardown, req.Method)
+
+		err2 = conn.WriteResponse(&base.Response{
+			StatusCode: base.StatusOK,
+		})
+		require.NoError(t, err2)
+	}()
+
+	c := Client{Protocol: new(ProtocolUDP)}
+
+	type sample struct {
+		pkt      *rtp.Packet
+		pts      int64
+		ntpAvail bool
+	}
+
+	samples := make(chan sample, 16)
+
+	err = readAll(&c, "rtsp://localhost:8554/teststream",
+		func(medi *description.Media, _ format.Format, pkt *rtp.Packet) {
+			v, _ := c.PacketPTS(medi, pkt)
+			_, ok := c.PacketNTP(medi, pkt)
+			samples <- sample{pkt: pkt, pts: v, ntpAvail: ok}
+		})
+	require.NoError(t, err)
+	defer c.Close()
+
+	var received []*rtp.Packet
+	var pts []int64
+	var ntps []bool
+	for range 4 {
+		v := <-samples
+		received = append(received, v.pkt)
+		pts = append(pts, v.pts)
+		ntps = append(ntps, v.ntpAvail)
+	}
+
+	require.Equal(t, []*rtp.Packet{
+		{
+			Header: rtp.Header{
+				Version:        2,
+				Marker:         true,
+				PayloadType:    96,
+				SequenceNumber: 1,
+				Timestamp:      1000,
+				SSRC:           1111,
+			},
+			Payload: []byte{5, 1, 2, 3},
+		},
+		{
+			Header: rtp.Header{
+				Version:        2,
+				Marker:         true,
+				PayloadType:    96,
+				SequenceNumber: 2,
+				Timestamp:      4000,
+				SSRC:           1111,
+			},
+			Payload: []byte{5, 4, 5, 6},
+		},
+		{
+			Header: rtp.Header{
+				Version:        2,
+				Marker:         true,
+				PayloadType:    96,
+				SequenceNumber: 9000,
+				Timestamp:      100000,
+				SSRC:           2222,
+			},
+			Payload: []byte{5, 7, 8, 9},
+		},
+		{
+			Header: rtp.Header{
+				Version:        2,
+				Marker:         true,
+				PayloadType:    96,
+				SequenceNumber: 9001,
+				Timestamp:      103000,
+				SSRC:           2222,
+			},
+			Payload: []byte{5, 13, 14, 15},
+		},
+	}, received)
+
+	// the discontinuity between the two sources is not counted as loss
+	stats := c.Stats()
+	require.Equal(t, uint64(0), stats.Session.InboundRTPPacketsLost)
+
+	// the new source has its own absolute time, computed from its own report
+	require.Equal(t, []bool{false, false, true, true}, ntps)
+
+	// the timeline is continuous across the source change: without the
+	// continuity logic, the new timestamp base would make the PTS jump by
+	// about 96000 units (the difference between the two timestamp bases).
+	require.Len(t, pts, 4)
+	require.Equal(t, int64(3000), pts[1]-pts[0])
+	require.GreaterOrEqual(t, pts[2], pts[1])
+	require.LessOrEqual(t, pts[2]-pts[1], int64(30000))
+	require.Equal(t, int64(3000), pts[3]-pts[2])
+}

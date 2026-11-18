@@ -621,7 +621,7 @@ type Client struct {
 	writerMutex           sync.RWMutex
 	writer                *asyncprocessor.Processor
 	reader                *clientReader
-	timeDecoder           *rtptime.GlobalDecoder
+	timeDecoder           atomic.Pointer[rtptime.GlobalDecoder]
 	mustClose             bool
 	tcpFrame              *base.InterleavedFrame
 	tcpBuffer             []byte
@@ -1117,8 +1117,9 @@ func (c *Client) trySwitchingProtocol() error {
 }
 
 func (c *Client) startTransportRoutines() {
-	c.timeDecoder = &rtptime.GlobalDecoder{}
-	c.timeDecoder.Initialize()
+	td := &rtptime.GlobalDecoder{}
+	td.Initialize()
+	c.timeDecoder.Store(td)
 
 	for _, cm := range c.setuppedMedias {
 		cm.start()
@@ -1165,7 +1166,7 @@ func (c *Client) stopTransportRoutines() {
 		cm.stop()
 	}
 
-	c.timeDecoder = nil
+	c.timeDecoder.Store(nil)
 }
 
 func (c *Client) createWriter() {
@@ -2591,7 +2592,13 @@ func (c *Client) WritePacketRTCP(medi *description.Media, pkt rtcp.Packet) error
 func (c *Client) PacketPTS(medi *description.Media, pkt *rtp.Packet) (int64, bool) {
 	cm := c.setuppedMedias[medi]
 	ct := cm.formats[pkt.PayloadType]
-	return c.timeDecoder.Decode(ct.format, pkt)
+
+	td := c.timeDecoder.Load()
+	if td == nil {
+		return 0, false
+	}
+
+	return td.Decode(ct.format, pkt)
 }
 
 // PacketNTP returns the NTP (absolute timestamp) of an inbound RTP packet.

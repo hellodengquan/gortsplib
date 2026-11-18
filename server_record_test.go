@@ -2027,3 +2027,185 @@ func TestServerRecordDifferentSSRCs(t *testing.T) {
 		})
 	}
 }
+
+func TestServerRecordSourceChange(t *testing.T) {
+	packets := make(chan *rtp.Packet, 16)
+	ntpAvailable := make(chan bool, 16)
+
+	var onRecordDone chan struct{}
+
+	s := &Server{
+		Handler: &testServerHandler{
+			onAnnounce: func(_ *ServerHandlerOnAnnounceCtx) (*base.Response, error) {
+				return &base.Response{
+					StatusCode: base.StatusOK,
+				}, nil
+			},
+			onSetup: func(_ *ServerHandlerOnSetupCtx) (*base.Response, *ServerStream, error) {
+				return &base.Response{
+					StatusCode: base.StatusOK,
+				}, nil, nil
+			},
+			onRecord: func(ctx *ServerHandlerOnRecordCtx) (*base.Response, error) {
+				ctx.Session.OnPacketRTPAny(func(medi *description.Media, _ format.Format, pkt *rtp.Packet) {
+					_, ok := ctx.Session.PacketNTP(medi, pkt)
+					ntpAvailable <- ok
+					packets <- pkt
+				})
+
+				close(onRecordDone)
+
+				return &base.Response{
+					StatusCode: base.StatusOK,
+				}, nil
+			},
+		},
+		UDPRTPAddress:  "127.0.0.1:8000",
+		UDPRTCPAddress: "127.0.0.1:8001",
+		RTSPAddress:    "localhost:8554",
+	}
+
+	err := s.Start()
+	require.NoError(t, err)
+	defer s.Close()
+
+	onRecordDone = make(chan struct{})
+
+	nconn, err := net.Dial("tcp", "localhost:8554")
+	require.NoError(t, err)
+	defer nconn.Close()
+	conn := conn.NewConn(bufio.NewReader(nconn), nconn)
+
+	medias := []*description.Media{testH264Media}
+
+	doAnnounce(t, conn, "rtsp://localhost:8554/teststream", medias)
+
+	l1, err := net.ListenPacket("udp", "localhost:34556")
+	require.NoError(t, err)
+	defer l1.Close()
+
+	l2, err := net.ListenPacket("udp", "localhost:34557")
+	require.NoError(t, err)
+	defer l2.Close()
+
+	inTH := &headers.Transport{
+		Delivery:    new(headers.TransportDeliveryUnicast),
+		Mode:        new(headers.TransportModeRecord),
+		Protocol:    headers.TransportProtocolUDP,
+		ClientPorts: &[2]int{34556, 34557},
+	}
+
+	res, th := doSetup(t, conn, "rtsp://localhost:8554/teststream/"+medias[0].Control, inTH, "")
+
+	session := readSession(t, res)
+
+	doRecord(t, conn, "rtsp://localhost:8554/teststream", session)
+
+	<-onRecordDone
+
+	writeRTP := func(pkt *rtp.Packet) {
+		_, err2 := l1.WriteTo(mustMarshalPacketRTP(pkt), &net.UDPAddr{
+			IP:   net.ParseIP("127.0.0.1"),
+			Port: th.ServerPorts[0],
+		})
+		require.NoError(t, err2)
+	}
+
+	writeSR := func(pkt *rtcp.SenderReport) {
+		_, err2 := l2.WriteTo(mustMarshalPacketRTCP(pkt), &net.UDPAddr{
+			IP:   net.ParseIP("127.0.0.1"),
+			Port: th.ServerPorts[1],
+		})
+		require.NoError(t, err2)
+	}
+
+	writeRTP(&rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			Marker:         true,
+			PayloadType:    96,
+			SequenceNumber: 1,
+			Timestamp:      1000,
+			SSRC:           1111,
+		},
+		Payload: []byte{5, 1, 2, 3},
+	})
+
+	writeRTP(&rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			Marker:         true,
+			PayloadType:    96,
+			SequenceNumber: 2,
+			Timestamp:      4000,
+			SSRC:           1111,
+		},
+		Payload: []byte{5, 4, 5, 6},
+	})
+
+	// a report of the new source is received before its first packet
+	writeSR(&rtcp.SenderReport{
+		SSRC:    2222,
+		NTPTime: ntp.Encode(time.Date(2018, 2, 20, 19, 0, 0, 0, time.UTC)),
+		RTPTime: 100000,
+	})
+
+	time.Sleep(100 * time.Millisecond)
+
+	// the camera is rebooted: the source changes.
+	writeRTP(&rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			Marker:         true,
+			PayloadType:    96,
+			SequenceNumber: 9000,
+			Timestamp:      100000,
+			SSRC:           2222,
+		},
+		Payload: []byte{5, 7, 8, 9},
+	})
+
+	// a late packet of the previous source must not switch back.
+	writeRTP(&rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			Marker:         true,
+			PayloadType:    96,
+			SequenceNumber: 3,
+			Timestamp:      7000,
+			SSRC:           1111,
+		},
+		Payload: []byte{5, 10, 11, 12},
+	})
+
+	for range 3 {
+		<-packets
+		<-ntpAvailable
+	}
+
+	select {
+	case pkt := <-packets:
+		t.Errorf("unexpected packet: %v", pkt)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	_, err = l1.WriteTo(mustMarshalPacketRTP(&rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			Marker:         true,
+			PayloadType:    96,
+			SequenceNumber: 9001,
+			Timestamp:      103000,
+			SSRC:           2222,
+		},
+		Payload: []byte{5, 13, 14, 15},
+	}), &net.UDPAddr{
+		IP:   net.ParseIP("127.0.0.1"),
+		Port: th.ServerPorts[0],
+	})
+	require.NoError(t, err)
+
+	<-packets
+	ok := <-ntpAvailable
+	require.True(t, ok)
+}
