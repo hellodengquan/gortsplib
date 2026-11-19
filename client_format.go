@@ -26,6 +26,10 @@ type clientFormat struct {
 	rtpReceiver           *rtpreceiver.Receiver // play
 	rtpSender             *rtpsender.Sender     // record or back channel
 	writePacketRTPInQueue func([]byte) error
+	// serializes packets delivered by the read goroutine and by the
+	// reordering wait timer, so that callbacks are never called concurrently
+	// or out of order.
+	deliverMutex sync.Mutex
 }
 
 func (cf *clientFormat) initialize() {
@@ -52,8 +56,13 @@ func (cf *clientFormat) initialize() {
 			ClockRate:            cf.format.ClockRate(),
 			LocalSSRC:            cf.localSSRC,
 			UnrealiableTransport: (cf.cm.udpRTPListener != nil),
+			MaxPacketWait:        cf.cm.c.MaxPacketWait,
 			Period:               cf.cm.c.receiverReportPeriod,
 			TimeNow:              cf.cm.c.timeNow,
+			PTSEqualsDTS:         cf.format.PTSEqualsDTS,
+			OnPackets: func(pkts []*rtp.Packet, lost uint64) {
+				cf.deliverPackets(pkts, lost)
+			},
 			WritePacketRTCP: func(pkt rtcp.Packet) {
 				if cf.cm.udpRTPListener != nil && cf.cm.udpRTCPListener.writeAddr != nil {
 					cf.cm.c.WritePacketRTCP(cf.cm.media, pkt) //nolint:errcheck
@@ -253,6 +262,19 @@ func (cf *clientFormat) readPacketRTP(payload []byte, header *rtp.Header, header
 
 	pkts, lost := cf.rtpReceiver.ProcessPacket2(pkt, now, cf.format.PTSEqualsDTS(pkt))
 
+	cf.deliverPackets(pkts, lost)
+
+	return true
+}
+
+// deliverPackets sends reordered packets and loss notifications to the upper
+// layer. It is used both for packets delivered synchronously by
+// ProcessPacket2() and for packets released by the reordering wait timer, so
+// that both follow the exact same callback contract.
+func (cf *clientFormat) deliverPackets(pkts []*rtp.Packet, lost uint64) {
+	cf.deliverMutex.Lock()
+	defer cf.deliverMutex.Unlock()
+
 	if lost != 0 {
 		cf.cm.c.OnPacketsLost(lost)
 	}
@@ -260,8 +282,6 @@ func (cf *clientFormat) readPacketRTP(payload []byte, header *rtp.Header, header
 	for _, pkt := range pkts {
 		cf.onPacketRTP(pkt)
 	}
-
-	return true
 }
 
 func (cf *clientFormat) writePacketRTP(pkt *rtp.Packet, ntp time.Time) error {

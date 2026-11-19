@@ -537,6 +537,15 @@ type Client struct {
 	UserAgent string
 	// disable automatic RTCP sender reports.
 	DisableRTCPSenderReports bool
+	// Maximum time to wait for a missing RTP packet before releasing the
+	// packets stored in the reordering buffer anyway.
+	// This only has effect with unreliable transports (UDP) and allows to
+	// avoid long media stalls when a packet is lost on a low-rate stream.
+	// The missing packets are counted as lost and signalled through
+	// OnPacketsLost, while the packets received after the gap are delivered
+	// in order through OnPacketRTP as soon as the deadline elapses.
+	// When zero, the reordering buffer is released only when it is full.
+	MaxPacketWait time.Duration
 	// explicitly request back channels to the server.
 	RequestBackChannels bool
 	// Range of ports used as source port in outbound UDP packets.

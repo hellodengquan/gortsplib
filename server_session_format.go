@@ -27,6 +27,10 @@ type serverSessionFormat struct {
 	rtpReceiver           *rtpreceiver.Receiver // record or back channel
 	writePacketRTPInQueue func([]byte) error
 	rtpSender             *rtpsender.Sender // play
+	// serializes packets delivered by the read goroutine and by the
+	// reordering wait timer, so that callbacks are never called concurrently
+	// or out of order.
+	deliverMutex sync.Mutex
 }
 
 func (ssf *serverSessionFormat) initialize() {
@@ -44,8 +48,13 @@ func (ssf *serverSessionFormat) initialize() {
 			ClockRate:            ssf.format.ClockRate(),
 			LocalSSRC:            ssf.localSSRC,
 			UnrealiableTransport: udp,
+			MaxPacketWait:        ssf.ssm.ss.s.MaxPacketWait,
 			Period:               ssf.ssm.ss.s.receiverReportPeriod,
 			TimeNow:              ssf.ssm.ss.s.timeNow,
+			PTSEqualsDTS:         ssf.format.PTSEqualsDTS,
+			OnPackets: func(pkts []*rtp.Packet, lost uint64) {
+				ssf.deliverPackets(pkts, lost)
+			},
 			WritePacketRTCP: func(pkt rtcp.Packet) {
 				if udp {
 					ssf.ssm.writePacketRTCP(pkt) //nolint:errcheck
@@ -257,6 +266,19 @@ func (ssf *serverSessionFormat) readPacketRTP(payload []byte, header *rtp.Header
 
 	pkts, lost := ssf.rtpReceiver.ProcessPacket2(pkt, now, ssf.format.PTSEqualsDTS(pkt))
 
+	ssf.deliverPackets(pkts, lost)
+
+	return true
+}
+
+// deliverPackets sends reordered packets and loss notifications to the upper
+// layer. It is used both for packets delivered synchronously by
+// ProcessPacket2() and for packets released by the reordering wait timer, so
+// that both follow the exact same callback contract.
+func (ssf *serverSessionFormat) deliverPackets(pkts []*rtp.Packet, lost uint64) {
+	ssf.deliverMutex.Lock()
+	defer ssf.deliverMutex.Unlock()
+
 	if lost != 0 {
 		if h, ok := ssf.ssm.ss.s.Handler.(ServerHandlerOnPacketsLost); ok {
 			h.OnPacketsLost(&ServerHandlerOnPacketsLostCtx{
@@ -278,8 +300,6 @@ func (ssf *serverSessionFormat) readPacketRTP(payload []byte, header *rtp.Header
 	for _, pkt := range pkts {
 		ssf.onPacketRTP(pkt)
 	}
-
-	return true
 }
 
 func (ssf *serverSessionFormat) writePacketRTP(pkt *rtp.Packet, ntp time.Time) error {

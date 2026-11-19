@@ -112,6 +112,16 @@ type Server struct {
 	MaxPacketSize int
 	// disable automatic RTCP sender reports.
 	DisableRTCPSenderReports bool
+	// Maximum time to wait for a missing RTP packet before releasing the
+	// packets stored in the reordering buffer anyway.
+	// This only has effect with unreliable transports (UDP) and allows to
+	// avoid long media stalls when a packet is lost on a low-rate stream.
+	// The missing packets are counted as lost and signalled through
+	// ServerHandlerOnPacketsLost, while the packets received after the gap
+	// are delivered in order through OnPacketRTP as soon as the deadline
+	// elapses.
+	// When zero, the reordering buffer is released only when it is full.
+	MaxPacketWait time.Duration
 	// authentication methods.
 	// It defaults to plain and digest+MD5.
 	AuthMethods []auth.Method

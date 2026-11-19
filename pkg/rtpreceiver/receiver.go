@@ -12,10 +12,13 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/ntp"
 )
 
+// maximum interval between checks for expired reordering waits.
+const maxPacketWaitCheckPeriod = 100 * time.Millisecond
+
 // Receiver is a utility to receive RTP packets.
 // It is in charge of:
 // - removing duplicate packets (when transport is unreliable)
-// - reordering packets (when transport is unrealiable)
+// - reordering packets (when transport is unreliable)
 // - counting received and lost packets
 // - generating RTCP receiver reports
 type Receiver struct {
@@ -33,6 +36,13 @@ type Receiver struct {
 	// It defaults to 64.
 	BufferSize int
 
+	// Maximum time to wait for a missing packet before the packets already
+	// stored in the reordering buffer are delivered anyway.
+	// This only has effect when UnrealiableTransport is true.
+	// When zero, the feature is disabled and packets are released only when
+	// the buffer is full, as in a receiver without this option.
+	MaxPacketWait time.Duration
+
 	// Period of RTCP receiver reports.
 	Period time.Duration
 
@@ -41,6 +51,20 @@ type Receiver struct {
 
 	// Called when a RTCP receiver report is ready to be written.
 	WritePacketRTCP func(rtcp.Packet)
+
+	// Used to determine whether the PTS of a packet is equal to its DTS.
+	// It is used when packets are delivered by the MaxPacketWait timer,
+	// i.e. outside of a ProcessPacket2() call.
+	// It defaults to a function returning true.
+	PTSEqualsDTS func(*rtp.Packet) bool
+
+	// Called when packets are delivered by the MaxPacketWait timer, i.e.
+	// without any new packet being received.
+	// It receives the delivered packets, in sequence number order, and the
+	// number of packets that were declared lost in order to release them.
+	// It is not called for packets returned by ProcessPacket2().
+	// When nil, timer-based delivery is disabled even if MaxPacketWait is set.
+	OnPackets func(pkts []*rtp.Packet, lost uint64)
 
 	mutex sync.RWMutex
 
@@ -61,11 +85,19 @@ type Receiver struct {
 	receivedAndLostSinceReport uint64
 	jitter                     float64
 
+	// time at which the current reordering wait started.
+	// It is zero when the reordering buffer is empty.
+	// It is used only when MaxPacketWait is set.
+	waitStart time.Time
+
 	// data from RTCP sender reports
 	firstSenderReportReceived  bool
 	lastSenderReportTimeNTP    uint64
 	lastSenderReportTimeRTP    uint32
 	lastSenderReportTimeSystem time.Time
+
+	// used to wake up the background goroutine when a wait starts.
+	wake chan struct{}
 
 	terminate chan struct{}
 	done      chan struct{}
@@ -85,8 +117,16 @@ func (rr *Receiver) Initialize() error {
 		rr.TimeNow = time.Now
 	}
 
+	if rr.PTSEqualsDTS == nil {
+		rr.PTSEqualsDTS = func(*rtp.Packet) bool { return true }
+	}
+
 	if rr.UnrealiableTransport {
 		rr.buffer = make([]*rtp.Packet, rr.BufferSize)
+	}
+
+	if rr.MaxPacketWait > 0 && rr.OnPackets != nil {
+		rr.wake = make(chan struct{}, 1)
 	}
 
 	rr.terminate = make(chan struct{})
@@ -106,20 +146,115 @@ func (rr *Receiver) Close() {
 func (rr *Receiver) run() {
 	defer close(rr.done)
 
-	t := time.NewTicker(rr.Period)
-	defer t.Stop()
+	reportTicker := time.NewTicker(rr.Period)
+	defer reportTicker.Stop()
+
+	// timer-based reordering is disabled, the goroutine only has to
+	// generate RTCP receiver reports.
+	if rr.wake == nil {
+		for {
+			select {
+			case <-reportTicker.C:
+				report := rr.report()
+				if report != nil && rr.WritePacketRTCP != nil {
+					rr.WritePacketRTCP(report)
+				}
+
+			case <-rr.terminate:
+				return
+			}
+		}
+	}
+
+	checkPeriod := rr.MaxPacketWait
+	if checkPeriod > maxPacketWaitCheckPeriod {
+		checkPeriod = maxPacketWaitCheckPeriod
+	}
+
+	waitTimer := time.NewTimer(checkPeriod)
+	timerPending := false
+	if !waitTimer.Stop() {
+		<-waitTimer.C
+	}
 
 	for {
-		select {
-		case <-t.C:
-			report := rr.report()
-			if report != nil {
-				rr.WritePacketRTCP(report)
-			}
+		// the timer is armed only while the reordering buffer is not empty.
+		if timerPending {
+			select {
+			case <-waitTimer.C:
+				rr.flushExpired()
+				timerPending = false
 
-		case <-rr.terminate:
-			return
+			case <-rr.wake:
+				if !waitTimer.Stop() {
+					select {
+					case <-waitTimer.C:
+					default:
+					}
+				}
+				timerPending = false
+
+			case <-reportTicker.C:
+				report := rr.report()
+				if report != nil && rr.WritePacketRTCP != nil {
+					rr.WritePacketRTCP(report)
+				}
+
+			case <-rr.terminate:
+				if !waitTimer.Stop() {
+					select {
+					case <-waitTimer.C:
+					default:
+					}
+				}
+				return
+			}
+		} else {
+			select {
+			case <-rr.wake:
+			case <-reportTicker.C:
+				report := rr.report()
+				if report != nil && rr.WritePacketRTCP != nil {
+					rr.WritePacketRTCP(report)
+				}
+
+			case <-rr.terminate:
+				return
+			}
 		}
+
+		// re-arm the timer if a wait is still pending.
+		if rr.isWaitPending() {
+			waitTimer.Reset(checkPeriod)
+			timerPending = true
+		}
+	}
+}
+
+func (rr *Receiver) isWaitPending() bool {
+	rr.mutex.RLock()
+	defer rr.mutex.RUnlock()
+	return !rr.waitStart.IsZero()
+}
+
+// flushExpired releases the content of the reordering buffer when the
+// maximum wait for a missing packet has elapsed.
+func (rr *Receiver) flushExpired() {
+	rr.mutex.Lock()
+
+	if rr.waitStart.IsZero() || rr.TimeNow().Sub(rr.waitStart) < rr.MaxPacketWait {
+		rr.mutex.Unlock()
+		return
+	}
+
+	pkts, lost := rr.flushBufferLocked()
+	system := rr.TimeNow()
+	rr.accountLocked(pkts, lost, system, rr.PTSEqualsDTS)
+
+	rr.mutex.Unlock()
+
+	if len(pkts) != 0 || lost != 0 {
+		rr.OnPackets(pkts, lost)
 	}
 }
 
@@ -213,12 +348,25 @@ func (rr *Receiver) ProcessPacket2(
 	var lost uint64
 
 	if rr.UnrealiableTransport {
-		pkts, lost = rr.reorder(pkt)
+		pkts, lost = rr.reorder(pkt, system)
 	} else {
 		pkts = []*rtp.Packet{pkt}
 		lost = uint64(pkt.SequenceNumber - rr.lastSequenceNumber - 1)
 	}
 
+	rr.accountLocked(pkts, lost, system, func(*rtp.Packet) bool { return ptsEqualsDTS })
+
+	return pkts, lost
+}
+
+// accountLocked updates statistics with a batch of delivered packets and
+// the number of packets declared lost to release them.
+func (rr *Receiver) accountLocked(
+	pkts []*rtp.Packet,
+	lost uint64,
+	system time.Time,
+	ptsEqualsDTS func(*rtp.Packet) bool,
+) {
 	rr.lost += lost
 	rr.lostSinceReport += lost
 	rr.received += uint64(len(pkts))
@@ -233,7 +381,7 @@ func (rr *Receiver) ProcessPacket2(
 
 		rr.lastSequenceNumber = pkt.SequenceNumber
 
-		if ptsEqualsDTS {
+		if ptsEqualsDTS(pkt) {
 			if rr.timeInitialized && rr.ClockRate != 0 {
 				// update jitter
 				// https://tools.ietf.org/html/rfc3550#page-39
@@ -250,11 +398,9 @@ func (rr *Receiver) ProcessPacket2(
 			rr.lastSystem = system
 		}
 	}
-
-	return pkts, lost
 }
 
-func (rr *Receiver) reorder(pkt *rtp.Packet) ([]*rtp.Packet, uint64) {
+func (rr *Receiver) reorder(pkt *rtp.Packet, system time.Time) ([]*rtp.Packet, uint64) {
 	relPos := int16(pkt.SequenceNumber - rr.lastSequenceNumber - 1)
 
 	// packet is a duplicate or has been sent
@@ -272,6 +418,9 @@ func (rr *Receiver) reorder(pkt *rtp.Packet) ([]*rtp.Packet, uint64) {
 				p := (rr.absPos + i) & (uint16(len(rr.buffer)) - 1)
 				rr.buffer[p] = nil
 			}
+
+			// the buffer has been cleared, any pending wait is obsolete.
+			rr.waitStart = time.Time{}
 
 			// reset position.
 			return []*rtp.Packet{pkt}, 0
@@ -306,6 +455,9 @@ func (rr *Receiver) reorder(pkt *rtp.Packet) ([]*rtp.Packet, uint64) {
 
 		ret[pos] = pkt
 
+		// the buffer is empty again, any pending wait is obsolete.
+		rr.waitStart = time.Time{}
+
 		return ret, uint64(int(relPos) - n + 1)
 	}
 
@@ -320,6 +472,15 @@ func (rr *Receiver) reorder(pkt *rtp.Packet) ([]*rtp.Packet, uint64) {
 
 		// put current packet in buffer
 		rr.buffer[p] = pkt
+		rr.signalWaitLocked(system)
+
+		// if the wait has already expired, release the buffer immediately,
+		// without waiting for the background timer.
+		if rr.MaxPacketWait > 0 && !rr.waitStart.IsZero() &&
+			system.Sub(rr.waitStart) >= rr.MaxPacketWait {
+			return rr.flushBufferLocked()
+		}
+
 		return nil, 0
 	}
 
@@ -346,7 +507,74 @@ func (rr *Receiver) reorder(pkt *rtp.Packet) ([]*rtp.Packet, uint64) {
 		rr.absPos &= (uint16(len(rr.buffer)) - 1)
 	}
 
+	// the wait ends when the buffer is empty again.
+	if rr.bufferEmptyLocked() {
+		rr.waitStart = time.Time{}
+	}
+
 	return ret, 0
+}
+
+// signalWaitLocked starts the reordering wait timer when a packet is stored
+// in the buffer for the first time since the buffer was empty.
+func (rr *Receiver) signalWaitLocked(system time.Time) {
+	if rr.MaxPacketWait == 0 || rr.OnPackets == nil || !rr.waitStart.IsZero() {
+		return
+	}
+
+	rr.waitStart = system
+	if rr.wake != nil {
+		select {
+		case rr.wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// bufferEmptyLocked returns whether the reordering buffer does not contain
+// any packet.
+func (rr *Receiver) bufferEmptyLocked() bool {
+	for i := uint16(0); i < uint16(len(rr.buffer)); i++ {
+		if rr.buffer[i] != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// flushBufferLocked returns all the packets stored in the reordering buffer,
+// in sequence number order, and the number of missing packets that were
+// skipped to release them. The buffer is cleared and the wait is ended.
+func (rr *Receiver) flushBufferLocked() ([]*rtp.Packet, uint64) {
+	n := 0
+	for i := uint16(0); i < uint16(len(rr.buffer)); i++ {
+		p := (rr.absPos + i) & (uint16(len(rr.buffer)) - 1)
+		if rr.buffer[p] != nil {
+			n++
+		}
+	}
+
+	ret := make([]*rtp.Packet, n)
+	pos := 0
+
+	for i := uint16(0); i < uint16(len(rr.buffer)); i++ {
+		p := (rr.absPos + i) & (uint16(len(rr.buffer)) - 1)
+		if rr.buffer[p] != nil {
+			ret[pos], rr.buffer[p] = rr.buffer[p], nil
+			pos++
+		}
+	}
+
+	// number of sequence numbers from the expected one to the sequence
+	// number of the last delivered packet, minus the packets that are
+	// actually delivered.
+	last := ret[n-1].SequenceNumber
+	lost := uint64(int16(last-rr.lastSequenceNumber)) - uint64(n)
+
+	// absPos is unchanged: the buffer wraps on itself and is now empty.
+	rr.waitStart = time.Time{}
+
+	return ret, lost
 }
 
 // ProcessSenderReport processes an inbound RTCP sender report.
